@@ -94,6 +94,11 @@ export function PreviewCanvas() {
             audioEl.pause();
             videoEl?.pause();
         } else {
+            // Seek to verse start if not already there
+            const startTime = audio.audioStartTime ?? 0;
+            if (Math.abs(audioEl.currentTime - startTime) > 1) {
+                audioEl.currentTime = startTime;
+            }
             audioEl.play();
             videoEl?.play();
         }

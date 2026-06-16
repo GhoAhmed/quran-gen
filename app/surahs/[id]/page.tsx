@@ -3,12 +3,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, ArrowRight } from "lucide-react";
-import { getSurahWithTranslation } from "../lib/api/quran";
-import type { AyahWithTranslation, Surah } from "../constants/quran";
-import { VerseRow } from "../components/picker/verse-row";
-import { Button } from "../components/ui/button";
-import { Spinner } from "../components/ui/spinner";
-import { useSelectionStore } from "../lib/store/selection-store";
+import { getSurahWithTranslation } from "../../lib/api/quran";
+import type { AyahWithTranslation, Surah } from "../../constants/quran";
+import { VerseRow } from "../../components/picker/verse-row";
+import { Button } from "../../components/ui/button";
+import { Spinner } from "../../components/ui/spinner";
+import { useSelectionStore } from "../../lib/store/selection-store";
 import Link from "next/link";
 
 export default function SurahDetailPage() {

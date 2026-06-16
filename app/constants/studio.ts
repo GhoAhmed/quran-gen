@@ -23,6 +23,7 @@ export interface AudioConfig {
   reciter: Reciter | null;
   customAudioUrl?: string;
   customAudioName?: string;
+  audioStartTime?: number; // seconds to seek to on play
   volume: number; // 0 - 1
 }
 

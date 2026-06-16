@@ -28,6 +28,12 @@ export const RECITERS: Reciter[] = [
     language: "ar",
   },
   {
+    identifier: "ar.mahermuaiqly",
+    name: "ماهر المعيقلي",
+    englishName: "Maher Al-Muaiqly",
+    language: "ar",
+  },
+  {
     identifier: "ar.husary",
     name: "محمود خليل الحصري",
     englishName: "Mahmoud Khalil Al-Husary",
@@ -46,6 +52,12 @@ export const RECITERS: Reciter[] = [
     language: "ar",
   },
   {
+    identifier: "ar.abdulbasitmujawwad",
+    name: "عبد الباسط مجوّد",
+    englishName: "Abdul Basit (Mujawwad)",
+    language: "ar",
+  },
+  {
     identifier: "ar.shaatree",
     name: "أبو بكر الشاطري",
     englishName: "Abu Bakr Al-Shatri",
@@ -61,6 +73,36 @@ export const RECITERS: Reciter[] = [
     identifier: "ar.hanirifai",
     name: "هاني الرفاعي",
     englishName: "Hani Ar-Rifai",
+    language: "ar",
+  },
+  {
+    identifier: "ar.ibrahimakhdar",
+    name: "إبراهيم الأخضر",
+    englishName: "Ibrahim Al-Akhdar",
+    language: "ar",
+  },
+  {
+    identifier: "ar.saoodshuraym",
+    name: "سعود الشريم",
+    englishName: "Saud Al-Shuraim",
+    language: "ar",
+  },
+  {
+    identifier: "ar.sudais",
+    name: "عبد الرحمن السديس",
+    englishName: "Abdurrahman As-Sudais",
+    language: "ar",
+  },
+  {
+    identifier: "ar.muhammadayyoub",
+    name: "محمد أيوب",
+    englishName: "Muhammad Ayyoub",
+    language: "ar",
+  },
+  {
+    identifier: "ar.parhizgar",
+    name: "محمد پرهیزگار",
+    englishName: "Mohammad Parhizgar",
     language: "ar",
   },
 ];

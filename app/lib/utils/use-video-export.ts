@@ -1,192 +1,212 @@
 import { useCallback, useRef, useState } from "react";
 import { ASPECT_RATIOS } from "../../constants";
-import { drawFrame } from "./canvas-renderer";
+import type { BackgroundConfig, CaptionStyle } from "../../constants/studio";
 import type { VerseTiming } from "./timing";
-import type {
-  BackgroundConfig,
-  CaptionStyle,
-  RenderState,
-} from "../../constants/studio";
+import { drawFrame } from "./canvas-renderer";
 
-interface ExportArgs {
+interface ExportOptions {
   aspectRatio: "9:16" | "16:9" | "1:1";
   background: BackgroundConfig;
   captionStyle: CaptionStyle;
   timings: VerseTiming[];
   audioUrl: string | null;
+  audioStartTime?: number;
   durationSeconds: number;
 }
 
-function pickMimeType(): string {
-  const candidates = [
-    "video/mp4;codecs=h264",
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm",
-  ];
-  for (const type of candidates) {
-    if (
-      typeof MediaRecorder !== "undefined" &&
-      MediaRecorder.isTypeSupported(type)
-    ) {
-      return type;
-    }
-  }
-  return "video/webm";
+type ExportStatus = "idle" | "preparing" | "recording" | "done" | "error";
+
+interface ExportState {
+  status: ExportStatus;
+  progress: number;
+  downloadUrl?: string;
+  error?: string;
 }
 
 export function useVideoExport() {
-  const [state, setState] = useState<RenderState>({
+  const [state, setState] = useState<ExportState>({
     status: "idle",
     progress: 0,
   });
-  const cancelRef = useRef(false);
+  const recorderRef = useRef<MediaRecorder | null>(null);
 
-  const exportVideo = useCallback(async (args: ExportArgs) => {
-    cancelRef.current = false;
+  const reset = useCallback(() => {
+    setState({ status: "idle", progress: 0 });
+  }, []);
+
+  const exportVideo = useCallback(async (opts: ExportOptions) => {
+    const {
+      aspectRatio,
+      background,
+      captionStyle,
+      timings,
+      audioUrl,
+      audioStartTime = 0,
+      durationSeconds,
+    } = opts;
+    const ratio = ASPECT_RATIOS.find((r) => r.id === aspectRatio)!;
+
     setState({ status: "preparing", progress: 0 });
 
     try {
-      const ratio = ASPECT_RATIOS.find((r) => r.id === args.aspectRatio)!;
+      // ── 1. Off-screen canvas ──────────────────────────────────────────
       const canvas = document.createElement("canvas");
       canvas.width = ratio.width;
       canvas.height = ratio.height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Canvas not supported");
+      const ctx = canvas.getContext("2d")!;
 
-      // Preload background media
+      // ── 2. Preload background media ───────────────────────────────────
       let bgMediaEl: HTMLImageElement | HTMLVideoElement | null = null;
-      if (args.background.type === "image" && args.background.url) {
-        bgMediaEl = await new Promise<HTMLImageElement>((resolve, reject) => {
-          const img = new Image();
-          img.onload = () => resolve(img);
-          img.onerror = reject;
-          img.src = args.background.url!;
+      if (background.type === "image" && background.url) {
+        const img = new Image();
+        await new Promise<void>((res, rej) => {
+          img.onload = () => res();
+          img.onerror = () => rej(new Error("Background image failed to load"));
+          img.src = background.url!;
         });
-      } else if (args.background.type === "video" && args.background.url) {
-        bgMediaEl = await new Promise<HTMLVideoElement>((resolve, reject) => {
-          const vid = document.createElement("video");
-          vid.muted = true;
-          vid.loop = true;
-          vid.playsInline = true;
-          vid.oncanplay = () => resolve(vid);
-          vid.onerror = reject;
-          vid.src = args.background.url!;
-        });
-        bgMediaEl.play();
+        bgMediaEl = img;
+      } else if (background.type === "video" && background.url) {
+        const vid = document.createElement("video");
+        vid.src = background.url;
+        vid.loop = true;
+        vid.muted = true;
+        vid.playsInline = true;
+        await vid.play();
+        bgMediaEl = vid;
       }
 
-      // Set up audio element + Web Audio graph so we can mux it into the recording
+      // ── 3. Set up audio ───────────────────────────────────────────────
+      let audioContext: AudioContext | null = null;
       let audioEl: HTMLAudioElement | null = null;
       let audioDestStream: MediaStream | null = null;
-      let audioCtx: AudioContext | null = null;
 
-      if (args.audioUrl) {
-        audioEl = new Audio(args.audioUrl);
-        audioEl.crossOrigin = "anonymous";
-        await new Promise<void>((resolve) => {
-          audioEl!.onloadedmetadata = () => resolve();
+      if (audioUrl) {
+        audioEl = new Audio();
+        // Do NOT set crossOrigin for cdn.islamic.network — it blocks Origin headers
+        audioEl.src = audioUrl;
+        audioEl.preload = "auto";
+
+        await new Promise<void>((res) => {
+          const timeout = setTimeout(() => res(), 6000); // always resolve after 6s
+          audioEl!.addEventListener(
+            "canplaythrough",
+            () => {
+              clearTimeout(timeout);
+              res();
+            },
+            { once: true },
+          );
+          audioEl!.addEventListener(
+            "error",
+            () => {
+              clearTimeout(timeout);
+              res(); // resolve anyway — play() will handle it
+            },
+            { once: true },
+          );
           audioEl!.load();
         });
 
-        audioCtx = new AudioContext();
-        const source = audioCtx.createMediaElementSource(audioEl);
-        const dest = audioCtx.createMediaStreamDestination();
+        audioContext = new AudioContext({ sampleRate: 44100 });
+        if (audioContext.state === "suspended") {
+          await audioContext.resume();
+        }
+
+        const source = audioContext.createMediaElementSource(audioEl);
+        const dest = audioContext.createMediaStreamDestination();
         source.connect(dest);
-        // Also connect to speakers is unnecessary for export (avoid echo); skip.
+        source.connect(audioContext.destination);
+
         audioDestStream = dest.stream;
       }
 
+      // ── 4. Combine streams ────────────────────────────────────────────
       const canvasStream = canvas.captureStream(30);
       const combinedStream = new MediaStream([
         ...canvasStream.getVideoTracks(),
-        ...(audioDestStream ? audioDestStream.getAudioTracks() : []),
+        ...(audioDestStream?.getAudioTracks() ?? []),
       ]);
 
-      const mimeType = pickMimeType();
+      // ── 5. Codec selection ────────────────────────────────────────────
+      const mimeType =
+        [
+          "video/webm;codecs=vp9,opus",
+          "video/webm;codecs=vp8,opus",
+          "video/webm",
+        ].find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
+
       const recorder = new MediaRecorder(combinedStream, {
-        mimeType,
-        videoBitsPerSecond: 6_000_000,
+        mimeType: mimeType || undefined,
+        videoBitsPerSecond: 4_000_000,
+        audioBitsPerSecond: 192_000,
       });
+      recorderRef.current = recorder;
 
       const chunks: Blob[] = [];
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
+      recorder.ondataavailable = (e) => e.data.size > 0 && chunks.push(e.data);
 
-      const stopped = new Promise<Blob>((resolve) => {
-        recorder.onstop = () => {
-          resolve(new Blob(chunks, { type: mimeType }));
-        };
-      });
-
+      // ── 6. Start recording ────────────────────────────────────────────
+      recorder.start(100);
       setState({ status: "recording", progress: 0 });
-      recorder.start();
-      audioEl?.play();
 
-      const totalMs = args.durationSeconds * 1000;
+      if (audioEl) {
+        audioEl.currentTime = audioStartTime; // ← seek to verse start
+        await audioEl.play();
+      }
+
+      // ── 7. Render loop ────────────────────────────────────────────────
       const startTime = performance.now();
+      const totalMs = durationSeconds * 1000;
 
       await new Promise<void>((resolve) => {
-        function tick() {
-          if (cancelRef.current) {
-            resolve();
-            return;
-          }
+        function renderFrame() {
           const elapsed = performance.now() - startTime;
           const currentTime = elapsed / 1000;
+          const progress = Math.min((elapsed / totalMs) * 100, 100);
+
+          setState({ status: "recording", progress: Math.round(progress) });
 
           drawFrame({
-            ctx: ctx!,
+            ctx,
             width: canvas.width,
             height: canvas.height,
-            background: args.background,
+            background,
             bgMediaEl,
-            captionStyle: args.captionStyle,
-            timings: args.timings,
+            captionStyle,
+            timings,
             currentTime,
           });
 
-          setState({
-            status: "recording",
-            progress: Math.min(100, Math.round((elapsed / totalMs) * 100)),
-          });
-
-          if (elapsed >= totalMs) {
+          if (elapsed < totalMs) {
+            requestAnimationFrame(renderFrame);
+          } else {
             resolve();
-            return;
           }
-          requestAnimationFrame(tick);
         }
-        tick();
+        renderFrame();
       });
 
-      recorder.stop();
-      audioEl?.pause();
+      // ── 8. Tear down ──────────────────────────────────────────────────
       if (bgMediaEl instanceof HTMLVideoElement) bgMediaEl.pause();
-      audioCtx?.close();
+      audioEl?.pause();
+      await audioContext?.close();
 
-      const blob = await stopped;
-      const url = URL.createObjectURL(blob);
-      setState({ status: "done", progress: 100, downloadUrl: url });
-      return url;
+      await new Promise<void>((res) => {
+        recorder.onstop = () => res();
+        recorder.stop();
+      });
+
+      const blob = new Blob(chunks, { type: mimeType || "video/webm" });
+      const downloadUrl = URL.createObjectURL(blob);
+      setState({ status: "done", progress: 100, downloadUrl });
     } catch (err) {
       setState({
         status: "error",
         progress: 0,
         error: err instanceof Error ? err.message : "Export failed",
       });
-      return null;
     }
   }, []);
 
-  const cancel = useCallback(() => {
-    cancelRef.current = true;
-  }, []);
-
-  const reset = useCallback(() => {
-    setState({ status: "idle", progress: 0 });
-  }, []);
-
-  return { state, exportVideo, cancel, reset };
+  return { state, exportVideo, reset };
 }

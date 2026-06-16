@@ -20,6 +20,8 @@ export function ExportPanel() {
 
     const isBusy = state.status === "preparing" || state.status === "recording";
 
+    const audioStartTime = audio.audioStartTime ?? 0;
+
     async function handleExport() {
         await exportVideo({
             aspectRatio,
@@ -27,7 +29,10 @@ export function ExportPanel() {
             captionStyle,
             timings,
             audioUrl,
-            durationSeconds: audioUrl ? durationInput : Math.max(durationInput, verses.length * 6),
+            audioStartTime,          // ← add this
+            durationSeconds: audioUrl
+                ? durationInput
+                : Math.max(durationInput, verses.length * 6),
         });
     }
 
