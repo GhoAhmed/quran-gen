@@ -1,26 +1,46 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { AlertCircle, Download, Film } from "lucide-react";
 import { useStudioStore } from "../../lib/store/studio-store";
 import { useEstimatedTimings } from "../../lib/utils/timing";
+import { useReciterTrack } from "../../lib/utils/use-reciter-track";
 import { useVideoExport } from "../../lib/utils/use-video-export";
 import { Button } from "../../components/ui/button";
 
 export function ExportPanel() {
-    const { verses, background, audio, captionStyle, aspectRatio } =
-        useStudioStore();
+    const { verses, background, audio, captionStyle, aspectRatio } = useStudioStore();
     const { state, exportVideo, reset } = useVideoExport();
     const [durationInput, setDurationInput] = useState(30);
 
-    const timings = useEstimatedTimings(verses, durationInput);
-    const audioUrl = audio.customAudioUrl ?? null;
+    // Exact per-ayah timings from reciter clips (empty if no reciter selected)
+    const reciterTrack = useReciterTrack(verses, audio.reciter ?? null);
+
+    // Fallback estimated timings for custom upload or no audio
+    const estimatedTimings = useEstimatedTimings(verses, durationInput);
+
+    // Decide which timings + queue to use
+    const hasReciter = !!audio.reciter && reciterTrack.clipUrls.length > 0;
+    const isCustomUpload = !audio.reciter && !!audio.customAudioUrl;
+
+    const timings = hasReciter ? reciterTrack.timings : estimatedTimings;
+
+    // audioQueue: per-ayah clips for reciter, single-item array for custom upload, empty otherwise
+    const audioQueue: string[] = hasReciter
+        ? reciterTrack.clipUrls
+        : isCustomUpload
+            ? [audio.customAudioUrl!]
+            : [];
+
+    const effectiveDuration = hasReciter
+        ? reciterTrack.totalDuration
+        : isCustomUpload
+            ? durationInput
+            : Math.max(durationInput, verses.length * 6);
 
     const canExport = verses.length > 0;
-
     const isBusy = state.status === "preparing" || state.status === "recording";
-
-    const audioStartTime = audio.audioStartTime ?? 0;
+    const isLoadingTrack = reciterTrack.loading;
 
     async function handleExport() {
         await exportVideo({
@@ -28,13 +48,12 @@ export function ExportPanel() {
             background,
             captionStyle,
             timings,
-            audioUrl,
-            audioStartTime,          // ← add this
-            durationSeconds: audioUrl
-                ? durationInput
-                : Math.max(durationInput, verses.length * 6),
+            audioQueue,
+            durationSeconds: effectiveDuration,
         });
     }
+
+    const fileExt = state.status === "done" ? (state.fileExtension ?? "webm") : "webm";
 
     return (
         <div className="space-y-4">
@@ -42,10 +61,11 @@ export function ExportPanel() {
                 <Film className="size-4 text-emerald-400" /> Export
             </h3>
 
-            {!audioUrl && (
+            {/* Duration slider — only shown when no exact duration is known */}
+            {!hasReciter && (
                 <div>
                     <label className="text-xs text-gray-400">
-                        Video duration (no audio uploaded): {durationInput}s
+                        Video duration: {durationInput}s
                     </label>
                     <input
                         type="range"
@@ -58,9 +78,21 @@ export function ExportPanel() {
                 </div>
             )}
 
+            {hasReciter && (
+                <p className="text-xs text-gray-400">
+                    Duration: {reciterTrack.totalDuration.toFixed(1)}s (from reciter audio)
+                </p>
+            )}
+
             {!canExport && (
                 <p className="text-xs text-amber-400 flex items-center gap-1.5">
                     <AlertCircle className="size-3.5" /> Select at least one verse first.
+                </p>
+            )}
+
+            {reciterTrack.error && (
+                <p className="text-xs text-red-400 flex items-center gap-1.5">
+                    <AlertCircle className="size-3.5" /> {reciterTrack.error}
                 </p>
             )}
 
@@ -78,9 +110,7 @@ export function ExportPanel() {
                             style={{ width: `${state.progress}%` }}
                         />
                     </div>
-                    <p className="text-xs text-gray-400">
-                        Rendering… {state.progress}%
-                    </p>
+                    <p className="text-xs text-gray-400">Rendering… {state.progress}%</p>
                 </div>
             )}
 
@@ -89,7 +119,7 @@ export function ExportPanel() {
                     <a
                         href={state.downloadUrl}
                         // eslint-disable-next-line react-hooks/purity
-                        download={`quran-studio-${Date.now()}.webm`}
+                        download={`quran-studio-${Date.now()}.${fileExt}`}
                         className="block"
                     >
                         <Button className="w-full">
@@ -107,15 +137,15 @@ export function ExportPanel() {
                 <Button
                     className="w-full"
                     onClick={handleExport}
-                    disabled={!canExport || isBusy}
+                    disabled={!canExport || isBusy || isLoadingTrack}
                 >
-                    {isBusy ? "Rendering…" : "Create video"}
+                    {isLoadingTrack ? "Loading audio…" : isBusy ? "Rendering…" : "Create video"}
                 </Button>
             )}
 
             <p className="text-[11px] text-gray-500 leading-relaxed">
                 Rendering happens entirely in your browser — nothing is uploaded.
-                Exports as WebM (H.264 MP4 used automatically where supported).
+                Exports as WebM (VP9+Opus), or MP4 where supported.
             </p>
         </div>
     );

@@ -1,212 +1,228 @@
 import { useCallback, useRef, useState } from "react";
 import { ASPECT_RATIOS } from "../../constants";
-import type { BackgroundConfig, CaptionStyle } from "../../constants/studio";
-import type { VerseTiming } from "./timing";
 import { drawFrame } from "./canvas-renderer";
+import type { VerseTiming } from "./timing";
+import type {
+  BackgroundConfig,
+  CaptionStyle,
+  RenderState,
+} from "../../constants/studio";
 
-interface ExportOptions {
+interface ExportArgs {
   aspectRatio: "9:16" | "16:9" | "1:1";
   background: BackgroundConfig;
   captionStyle: CaptionStyle;
   timings: VerseTiming[];
-  audioUrl: string | null;
-  audioStartTime?: number;
+  audioQueue: string[];
   durationSeconds: number;
 }
 
-type ExportStatus = "idle" | "preparing" | "recording" | "done" | "error";
-
-interface ExportState {
-  status: ExportStatus;
-  progress: number;
-  downloadUrl?: string;
-  error?: string;
+function pickMimeType(): string {
+  const candidates = [
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+  ];
+  for (const type of candidates) {
+    if (
+      typeof MediaRecorder !== "undefined" &&
+      MediaRecorder.isTypeSupported(type)
+    ) {
+      return type;
+    }
+  }
+  return "video/webm";
 }
 
 export function useVideoExport() {
-  const [state, setState] = useState<ExportState>({
+  const [state, setState] = useState<RenderState>({
     status: "idle",
     progress: 0,
   });
-  const recorderRef = useRef<MediaRecorder | null>(null);
+  const cancelRef = useRef(false);
 
-  const reset = useCallback(() => {
-    setState({ status: "idle", progress: 0 });
-  }, []);
-
-  const exportVideo = useCallback(async (opts: ExportOptions) => {
-    const {
-      aspectRatio,
-      background,
-      captionStyle,
-      timings,
-      audioUrl,
-      audioStartTime = 0,
-      durationSeconds,
-    } = opts;
-    const ratio = ASPECT_RATIOS.find((r) => r.id === aspectRatio)!;
-
+  const exportVideo = useCallback(async (args: ExportArgs) => {
+    cancelRef.current = false;
     setState({ status: "preparing", progress: 0 });
 
     try {
-      // ── 1. Off-screen canvas ──────────────────────────────────────────
+      const ratio = ASPECT_RATIOS.find((r) => r.id === args.aspectRatio)!;
       const canvas = document.createElement("canvas");
       canvas.width = ratio.width;
       canvas.height = ratio.height;
-      const ctx = canvas.getContext("2d")!;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas not supported");
 
-      // ── 2. Preload background media ───────────────────────────────────
+      // ── Preload background media ──────────────────────────────────────
       let bgMediaEl: HTMLImageElement | HTMLVideoElement | null = null;
-      if (background.type === "image" && background.url) {
-        const img = new Image();
-        await new Promise<void>((res, rej) => {
-          img.onload = () => res();
-          img.onerror = () => rej(new Error("Background image failed to load"));
-          img.src = background.url!;
+      if (args.background.type === "image" && args.background.url) {
+        bgMediaEl = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = args.background.url!;
         });
-        bgMediaEl = img;
-      } else if (background.type === "video" && background.url) {
-        const vid = document.createElement("video");
-        vid.src = background.url;
-        vid.loop = true;
-        vid.muted = true;
-        vid.playsInline = true;
-        await vid.play();
-        bgMediaEl = vid;
+      } else if (args.background.type === "video" && args.background.url) {
+        bgMediaEl = await new Promise<HTMLVideoElement>((resolve, reject) => {
+          const vid = document.createElement("video");
+          vid.muted = true;
+          vid.loop = true;
+          vid.playsInline = true;
+          vid.oncanplay = () => resolve(vid);
+          vid.onerror = reject;
+          vid.src = args.background.url!;
+        });
+        await bgMediaEl.play();
       }
 
-      // ── 3. Set up audio ───────────────────────────────────────────────
-      let audioContext: AudioContext | null = null;
-      let audioEl: HTMLAudioElement | null = null;
+      // ── Audio via fetch → AudioBuffer (no CORS issues) ────────────────
+      // Using fetch + decodeAudioData instead of <audio> + createMediaElementSource
+      // because the CDN doesn't send CORS headers, which makes crossOrigin="anonymous"
+      // fail with "element has no supported sources". Fetch reads the raw bytes
+      // and we decode locally — no Origin header negotiation needed.
+      let audioCtx: AudioContext | null = null;
       let audioDestStream: MediaStream | null = null;
+      let totalAudioDuration = 0;
 
-      if (audioUrl) {
-        audioEl = new Audio();
-        // Do NOT set crossOrigin for cdn.islamic.network — it blocks Origin headers
-        audioEl.src = audioUrl;
-        audioEl.preload = "auto";
+      if (args.audioQueue.length) {
+        audioCtx = new AudioContext();
+        if (audioCtx.state === "suspended") await audioCtx.resume();
 
-        await new Promise<void>((res) => {
-          const timeout = setTimeout(() => res(), 6000); // always resolve after 6s
-          audioEl!.addEventListener(
-            "canplaythrough",
-            () => {
-              clearTimeout(timeout);
-              res();
-            },
-            { once: true },
-          );
-          audioEl!.addEventListener(
-            "error",
-            () => {
-              clearTimeout(timeout);
-              res(); // resolve anyway — play() will handle it
-            },
-            { once: true },
-          );
-          audioEl!.load();
-        });
-
-        audioContext = new AudioContext({ sampleRate: 44100 });
-        if (audioContext.state === "suspended") {
-          await audioContext.resume();
-        }
-
-        const source = audioContext.createMediaElementSource(audioEl);
-        const dest = audioContext.createMediaStreamDestination();
-        source.connect(dest);
-        source.connect(audioContext.destination);
-
+        const dest = audioCtx.createMediaStreamDestination();
         audioDestStream = dest.stream;
+
+        // Fetch and decode all clips in parallel for speed
+        setState({ status: "preparing", progress: 0 });
+        const buffers = await Promise.all(
+          args.audioQueue.map(async (url) => {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Failed to fetch audio: ${url}`);
+            const arrayBuffer = await res.arrayBuffer();
+            return audioCtx!.decodeAudioData(arrayBuffer);
+          }),
+        );
+
+        // Schedule all clips sequentially with no gap
+        let scheduleAt = audioCtx.currentTime + 0.05;
+        for (const buffer of buffers) {
+          const source = audioCtx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(dest);
+          source.start(scheduleAt);
+          scheduleAt += buffer.duration;
+          totalAudioDuration += buffer.duration;
+        }
       }
 
-      // ── 4. Combine streams ────────────────────────────────────────────
+      // ── Combine canvas + audio streams ────────────────────────────────
       const canvasStream = canvas.captureStream(30);
       const combinedStream = new MediaStream([
         ...canvasStream.getVideoTracks(),
-        ...(audioDestStream?.getAudioTracks() ?? []),
+        ...(audioDestStream ? audioDestStream.getAudioTracks() : []),
       ]);
 
-      // ── 5. Codec selection ────────────────────────────────────────────
-      const mimeType =
-        [
-          "video/webm;codecs=vp9,opus",
-          "video/webm;codecs=vp8,opus",
-          "video/webm",
-        ].find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
-
+      const mimeType = pickMimeType();
       const recorder = new MediaRecorder(combinedStream, {
-        mimeType: mimeType || undefined,
-        videoBitsPerSecond: 4_000_000,
+        mimeType,
+        videoBitsPerSecond: 6_000_000,
         audioBitsPerSecond: 192_000,
       });
-      recorderRef.current = recorder;
 
       const chunks: Blob[] = [];
-      recorder.ondataavailable = (e) => e.data.size > 0 && chunks.push(e.data);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
 
-      // ── 6. Start recording ────────────────────────────────────────────
-      recorder.start(100);
+      const stopped = new Promise<Blob>((resolve) => {
+        recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+      });
+
+      // Use whichever is longer: caller's estimate or actual audio duration
+      const effectiveDuration = Math.max(
+        args.durationSeconds,
+        totalAudioDuration,
+        0.1,
+      );
+      const totalMs = effectiveDuration * 1000;
+
+      // Start recorder BEFORE audio begins playing (AudioContext schedules
+      // clips relative to currentTime, which is already ticking)
+      recorder.start(250);
       setState({ status: "recording", progress: 0 });
 
-      if (audioEl) {
-        audioEl.currentTime = audioStartTime; // ← seek to verse start
-        await audioEl.play();
-      }
-
-      // ── 7. Render loop ────────────────────────────────────────────────
       const startTime = performance.now();
-      const totalMs = durationSeconds * 1000;
 
+      // ── Render loop ───────────────────────────────────────────────────
       await new Promise<void>((resolve) => {
-        function renderFrame() {
+        function tick() {
+          if (cancelRef.current) {
+            resolve();
+            return;
+          }
+
           const elapsed = performance.now() - startTime;
           const currentTime = elapsed / 1000;
-          const progress = Math.min((elapsed / totalMs) * 100, 100);
-
-          setState({ status: "recording", progress: Math.round(progress) });
 
           drawFrame({
-            ctx,
+            ctx: ctx!,
             width: canvas.width,
             height: canvas.height,
-            background,
+            background: args.background,
             bgMediaEl,
-            captionStyle,
-            timings,
+            captionStyle: args.captionStyle,
+            timings: args.timings,
             currentTime,
           });
 
-          if (elapsed < totalMs) {
-            requestAnimationFrame(renderFrame);
-          } else {
+          setState({
+            status: "recording",
+            progress: Math.min(100, Math.round((elapsed / totalMs) * 100)),
+          });
+
+          if (elapsed >= totalMs) {
             resolve();
+            return;
           }
+          requestAnimationFrame(tick);
         }
-        renderFrame();
+        tick();
       });
 
-      // ── 8. Tear down ──────────────────────────────────────────────────
+      // Flush final chunk before stopping
+      await new Promise((r) => setTimeout(r, 300));
+
+      recorder.stop();
       if (bgMediaEl instanceof HTMLVideoElement) bgMediaEl.pause();
-      audioEl?.pause();
-      await audioContext?.close();
+      await audioCtx?.close();
 
-      await new Promise<void>((res) => {
-        recorder.onstop = () => res();
-        recorder.stop();
+      const blob = await stopped;
+      if (blob.size === 0)
+        throw new Error("Recording produced an empty file — try again");
+
+      const url = URL.createObjectURL(blob);
+      setState({
+        status: "done",
+        progress: 100,
+        downloadUrl: url,
+        fileExtension: "webm",
       });
-
-      const blob = new Blob(chunks, { type: mimeType || "video/webm" });
-      const downloadUrl = URL.createObjectURL(blob);
-      setState({ status: "done", progress: 100, downloadUrl });
+      return url;
     } catch (err) {
       setState({
         status: "error",
         progress: 0,
         error: err instanceof Error ? err.message : "Export failed",
       });
+      return null;
     }
   }, []);
 
-  return { state, exportVideo, reset };
+  const cancel = useCallback(() => {
+    cancelRef.current = true;
+  }, []);
+  const reset = useCallback(() => {
+    setState({ status: "idle", progress: 0 });
+  }, []);
+
+  return { state, exportVideo, cancel, reset };
 }

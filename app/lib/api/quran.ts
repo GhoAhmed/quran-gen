@@ -99,12 +99,6 @@ export const RECITERS: Reciter[] = [
     englishName: "Muhammad Ayyoub",
     language: "ar",
   },
-  {
-    identifier: "ar.parhizgar",
-    name: "محمد پرهیزگار",
-    englishName: "Mohammad Parhizgar",
-    language: "ar",
-  },
 ];
 
 export async function getSurahs(): Promise<Surah[]> {
@@ -133,7 +127,6 @@ export async function getSurahWithTranslation(
     translation: translation.ayahs[i]?.text,
   }));
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { ayahs: _omit, ...surahMeta } = arabic;
   return { surah: surahMeta, ayahs };
 }
@@ -147,4 +140,59 @@ export async function getSurahAudio(
     `${BASE_URL}/surah/${number}/${reciterId}`,
   );
   return data.ayahs;
+}
+
+/**
+ * Fetch per-ayah audio URLs for a specific surah/reciter, filtered down to
+ * only the requested verse numbers (numberInSurah), in order.
+ */
+export async function getReciterAudioForVerses(
+  surahNumber: number,
+  reciterId: string,
+  numbersInSurah: number[],
+): Promise<{ numberInSurah: number; audio: string }[]> {
+  const ayahs = await getSurahAudio(surahNumber, reciterId);
+  const wanted = new Set(numbersInSurah);
+  const result = ayahs
+    .filter((a) => wanted.has(a.numberInSurah))
+    .filter((a) => !!a.audio)
+    .map((a) => ({ numberInSurah: a.numberInSurah, audio: a.audio! }));
+
+  if (result.length !== numbersInSurah.length) {
+    throw new Error(
+      `Audio unavailable for ${numbersInSurah.length - result.length} of ${numbersInSurah.length} selected verse(s)`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Checks which reciters from RECITERS actually have audio available for
+ * every requested verse in a surah. Returns only the reciters that work,
+ * so the UI can hide/disable broken ones instead of letting users hit a
+ * silent/failed export later.
+ *
+ * Runs checks in parallel with a short concurrency-friendly approach;
+ * a reciter is considered "available" only if ALL requested verses
+ * resolve to a real audio URL.
+ */
+export async function getAvailableReciters(
+  surahNumber: number,
+  numbersInSurah: number[],
+): Promise<{ reciter: Reciter; available: boolean }[]> {
+  const checks = await Promise.all(
+    RECITERS.map(async (reciter) => {
+      try {
+        await getReciterAudioForVerses(
+          surahNumber,
+          reciter.identifier,
+          numbersInSurah,
+        );
+        return { reciter, available: true };
+      } catch {
+        return { reciter, available: false };
+      }
+    }),
+  );
+  return checks;
 }

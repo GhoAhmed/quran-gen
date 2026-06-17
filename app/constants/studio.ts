@@ -23,7 +23,6 @@ export interface AudioConfig {
   reciter: Reciter | null;
   customAudioUrl?: string;
   customAudioName?: string;
-  audioStartTime?: number; // seconds to seek to on play
   volume: number; // 0 - 1
 }
 
@@ -46,5 +45,6 @@ export interface RenderState {
   status: "idle" | "preparing" | "recording" | "done" | "error";
   progress: number; // 0 - 100
   downloadUrl?: string;
+  fileExtension?: "mp4" | "webm";
   error?: string;
 }
